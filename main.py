@@ -376,7 +376,7 @@ async def get_assetlinks():
                 "target": {
                     "namespace": "android_app",
                     "package_name": "com.satyasurya306.callscreener",
-                    "sha256_cert_fingerprints": ["PASTE_YOUR_SHA256_FINGERPRINT_HERE"],
+                    "sha256_cert_fingerprints": ["52:FA:07:11:BF:68:7C:A0:10:5A:31:3D:0C:F5:72:59:02:5B:69:F9:6B:C2:13:CB:F6:BB:8A:8E:97:A5:6B:91"],
                 },
             }
         ]
