@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -24,8 +24,9 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 SYSTEM_PROMPT = """
 You are a polite, concise AI call screener answering the phone for Chandra.
 1. Ask the caller for their name and the reason for their call.
-2. Keep every spoken response under 2 short sentences.
-3. Never use markdown, bullet points, or emojis (this is spoken audio).
+2. Once you have both their name and a clear reason, tell them you are checking with Chandra right now to see if he can take the call.
+3. Keep every spoken response under 2 short sentences.
+4. Never use markdown, bullet points, or emojis (this is spoken audio).
 """
 
 MODELS = [
@@ -38,8 +39,14 @@ MODELS = [
 
 
 class CallSummary(BaseModel):
-    caller_name: str = Field(default="Unknown Caller", description="Caller's name if mentioned, else Unknown Caller.")
-    reason: str = Field(default="Screening in progress...", description="Short summary of why the caller is calling.")
+    caller_name: str = Field(
+        default="Unknown Caller",
+        description="Caller's name if mentioned, else Unknown Caller.",
+    )
+    reason: str = Field(
+        default="Screening in progress...",
+        description="Short summary of why the caller is calling.",
+    )
 
 
 class DecisionRequest(BaseModel):
@@ -96,11 +103,15 @@ class CallStateManager:
         stale = []
         for ws in list(self.active_call_sockets):
             try:
-                await ws.send_text(json.dumps({
-                    "type": "text",
-                    "token": message_text,
-                    "last": True,
-                }))
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "text",
+                            "token": message_text,
+                            "last": True,
+                        }
+                    )
+                )
             except Exception:
                 stale.append(ws)
         for ws in stale:
@@ -111,7 +122,6 @@ state = CallStateManager()
 
 
 async def generate_with_fallback(contents: list[dict], system_instruction: str):
-    response = None
     last_error = None
     for model_name in MODELS:
         try:
@@ -162,6 +172,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0b0f17" />
+  <link rel="manifest" href="/manifest.json" />
   <title>Chandra — Live AI Call Screener</title>
   <style>
     :root {
@@ -242,6 +254,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws/dashboard`);
     const connBadge = document.getElementById("connBadge");
@@ -306,9 +322,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/dashboard")
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard():
     return DASHBOARD_HTML
+
+
+@app.get("/manifest.json")
+async def get_manifest():
+    return JSONResponse(
+        {
+            "name": "Chandra AI Call Screener",
+            "short_name": "Call Screener",
+            "start_url": "/dashboard",
+            "display": "standalone",
+            "background_color": "#0b0f17",
+            "theme_color": "#0b0f17",
+            "icons": [
+                {
+                    "src": "https://cdn-icons-png.flaticon.com/512/724/724664.png",
+                    "sizes": "512x512",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                }
+            ],
+        }
+    )
+
+
+@app.get("/sw.js")
+async def get_service_worker():
+    sw_code = """
+    self.addEventListener('install', () => self.skipWaiting());
+    self.addEventListener('activate', () => self.clients.claim());
+    self.addEventListener('fetch', (event) => {
+      event.respondWith(fetch(event.request).catch(() => new Response('Offline')));
+    });
+    """
+    return Response(content=sw_code, media_type="application/javascript")
+
+
+@app.get("/.well-known/assetlinks.json")
+async def get_assetlinks():
+    # Replace package_name and sha256_cert_fingerprints after generating your package on PWABuilder
+    return JSONResponse(
+        [
+            {
+                "relation": ["delegate_permission/common.handle_all_urls"],
+                "target": {
+                    "namespace": "android_app",
+                    "package_name": "com.satyasurya306.callscreener",
+                    "sha256_cert_fingerprints": ["PASTE_YOUR_SHA256_FINGERPRINT_HERE"],
+                },
+            }
+        ]
+    )
 
 
 @app.websocket("/ws/dashboard")
@@ -339,21 +411,16 @@ async def handle_decision(req: DecisionRequest):
     state.transcript.append({"speaker": "ai", "text": spoken, "time": now_str})
     await state.send_to_active_calls(spoken)
 
+    state.history_log.append(
+        {
+            "caller_name": state.caller_name,
+            "reason": state.reason,
+            "decision": "declined" if action == "decline" else "accepted",
+            "time": now_str,
+        }
+    )
     if action == "decline":
-        state.history_log.append({
-            "caller_name": state.caller_name,
-            "reason": state.reason,
-            "decision": "declined",
-            "time": now_str,
-        })
         state.call_active = False
-    else:
-        state.history_log.append({
-            "caller_name": state.caller_name,
-            "reason": state.reason,
-            "decision": "accepted",
-            "time": now_str,
-        })
 
     await state.broadcast_dashboard(state.snapshot())
     return {"status": "ok", "decision": action}
@@ -401,15 +468,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 now_str = datetime.now().strftime("%I:%M:%S %p")
                 print(f"\n[CALLER]: {caller_text}")
                 history.append({"role": "user", "parts": [{"text": caller_text}]})
-                state.transcript.append({"speaker": "caller", "text": caller_text, "time": now_str})
+                state.transcript.append(
+                    {"speaker": "caller", "text": caller_text, "time": now_str}
+                )
                 await state.broadcast_dashboard(state.snapshot())
 
                 response = await generate_with_fallback(history, SYSTEM_PROMPT)
-                ai_reply = (response.text or "Sorry, could you please repeat that?").strip()
+                ai_reply = (
+                    response.text or "Sorry, could you please repeat that?"
+                ).strip()
                 history.append({"role": "model", "parts": [{"text": ai_reply}]})
 
                 ai_time = datetime.now().strftime("%I:%M:%S %p")
-                state.transcript.append({"speaker": "ai", "text": ai_reply, "time": ai_time})
+                state.transcript.append(
+                    {"speaker": "ai", "text": ai_reply, "time": ai_time}
+                )
 
                 summary = await extract_caller_summary(state.transcript)
                 if summary.caller_name and summary.caller_name != "Unknown Caller":
@@ -420,11 +493,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 await state.broadcast_dashboard(state.snapshot())
                 print(f"[AI SCREENER]: {ai_reply}")
 
-                await websocket.send_text(json.dumps({
-                    "type": "text",
-                    "token": ai_reply,
-                    "last": True,
-                }))
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "text",
+                            "token": ai_reply,
+                            "last": True,
+                        }
+                    )
+                )
 
     except WebSocketDisconnect:
         print("\n--- Call ended ---")
@@ -432,10 +509,14 @@ async def websocket_endpoint(websocket: WebSocket):
         await state.broadcast_dashboard(state.snapshot())
     except Exception as e:
         print(f"\n[SERVER ERROR]: {e}")
-        await websocket.send_text(json.dumps({
-            "type": "text",
-            "token": f"ERROR: {e}",
-            "last": True,
-        }))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "text",
+                    "token": f"ERROR: {e}",
+                    "last": True,
+                }
+            )
+        )
     finally:
         state.active_call_sockets.discard(websocket)
